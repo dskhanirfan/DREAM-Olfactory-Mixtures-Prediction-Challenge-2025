@@ -1,0 +1,225 @@
+# Set library paths
+.libPaths(c("/projappl/project_2006318/project_rpackages_4.4.2", .libPaths()))
+libpath <- .libPaths()[1]
+
+# Load required packages
+library(catboost)
+library(glmnet)
+library(Matrix)
+
+# 1. Read data & saved BEMKL outputs
+
+#df          <- read.csv("/scratch/project_2006318/dataset_on_31_May_2025.csv")
+df          <- read.csv("/scratch/project_2006318/data_created_on_26_July_2025.csv")
+df_t        <- read.csv("/scratch/project_2006318/testData/dataset_on_01_June_2025_Test.csv")
+#df_t        <- read.csv("/scratch/project_2006318/dataset_on_01_June_2025_Leaderboard.csv")
+#subf    <- read.csv("/scratch/project_2006318/TASK1_leaderboard_set_Submission_form.csv")
+subf    <- read.csv("/scratch/project_2006318/testData/TASK1_test_set_Submission_form.csv")
+mol_t         <- subf[[1]]
+pp_preds    <- read.csv("/scratch/project_2006318/testData/Y_predictions_intensity_pleasantness_catboost.csv")
+#pp_preds    <- read.csv("/scratch/project_2006318/testData/Y_predictions_intensity_pleasantness_lll_27june_2.csv")
+
+Y_bemkl_tr <- readRDS("/scratch/project_2006318/Y_bemkl_tr_full.rds")   # Ntrain × P
+Y_bemkl_te <- readRDS("/scratch/project_2006318/Y_bemkl_te_full.rds")   # Ntst  × P
+
+
+
+# 2. Define targets
+Y_columns <- c(
+  "Green","Cucumber","Herbal","Mint","Woody","Pine","Floral","Powdery","Fruity",
+  "Citrus","Tropical","Berry","Peach","Sweet","Caramellic","Vanilla","BrownSpice",
+  "Smoky","Burnt","Roasted","Grainy","Meaty","Nutty","Fatty","Coconut","Waxy","Dairy",
+  "Buttery","Cheesy","Sour","Fermented","Sulfurous","Garlic.Onion","Earthy","Mushroom",
+  "Musty","Ammonia","Fishy","Fecal","Rotten.Decay","Rubber","Phenolic","Animal",
+  "Medicinal","Cooling","Sharp","Chlorine","Alcoholic","Plastic","Ozone","Metallic"
+)
+
+# 3. Preprocessing helpers
+robust_scaler <- function(mat) {
+  list(
+    medians = apply(mat, 2, median, na.rm = TRUE),
+    iqrs    = apply(mat, 2, IQR,    na.rm = TRUE)
+  )
+}
+apply_robust <- function(mat, sc) {
+  tmp <- sweep(mat, 2, sc$medians, "-")
+  sweep(tmp, 2, sc$iqrs + 1e-10, "/")
+}
+
+# 4. Build feature frames, drop targets & coords
+drop_cols  <- c(Y_columns, "molecule_x", "molecule_y", "molecule")
+X_tr_full  <- df[ , !(names(df)   %in% drop_cols)]
+X_te_full  <- df_t[ , !(names(df_t) %in% drop_cols)]
+
+block3_cols <- names(df)[1830:1967]
+dil_col     <- "dilution"
+
+# 5. Impute & convert block-3 → numeric
+for (col in block3_cols) {
+  X_tr_full[[col]] <- as.numeric(X_tr_full[[col]])
+  X_te_full[[col]] <- as.numeric(X_te_full[[col]])
+  mu <- mean(X_tr_full[[col]], na.rm = TRUE)
+  X_tr_full[[col]][is.na(X_tr_full[[col]])] <- mu
+  X_te_full[[col]][is.na(X_te_full[[col]])]   <- mu
+}
+
+# 6. Log₁₀ + z-scale block-3
+X3_tr_log <- log10(as.matrix(X_tr_full[, block3_cols]) + 1e-6)
+sc3       <- robust_scaler(X3_tr_log)
+X3_tr     <- apply_robust(X3_tr_log, sc3)
+
+X3_te_log <- log10(as.matrix(X_te_full[, block3_cols]) + 1e-6)
+X3_te     <- apply_robust(X3_te_log, sc3)
+
+# 7. Log₁₀ + z-scale dilution
+X4_tr_log <- log10(as.matrix(X_tr_full[, dil_col, drop = FALSE]) + 1e-6)
+sc4       <- robust_scaler(X4_tr_log)
+X4_tr     <- apply_robust(X4_tr_log, sc4)
+
+X4_te_log <- log10(as.matrix(X_te_full[, dil_col, drop = FALSE]) + 1e-6)
+X4_te     <- apply_robust(X4_te_log, sc4)
+
+# 8. Drop raw block-3 & dilution, combine transformed
+X_tr_base <- X_tr_full[, !(names(X_tr_full) %in% c(block3_cols, dil_col))]
+X_te_base <- X_te_full[, !(names(X_te_full) %in% c(block3_cols, dil_col))]
+
+X_train <- cbind(X_tr_base, X3_tr, X4_tr)
+X_test  <- cbind(X_te_base, X3_te, X4_te)
+
+# 9. Add Intensity & Pleasantness
+X_train$Intensity    <- df$Intensity
+X_train$Pleasantness <- df$Pleasantness
+X_test$Intensity     <- pp_preds$Intensity
+X_test$Pleasantness  <- pp_preds$Pleasantness
+
+# 10. Convert non-numeric → factor
+for (col in names(X_train)) {
+  if (!is.numeric(X_train[[col]])) {
+    X_train[[col]] <- as.factor(X_train[[col]])
+    X_test[[col]]  <- as.factor(X_test[[col]])
+  }
+}
+
+# 11. Drop any feature constant in train (1 unique value)
+const_feats <- names(which(sapply(X_train, function(x) length(unique(x))) <= 1))
+if (length(const_feats)) {
+  X_train <- X_train[, !(names(X_train) %in% const_feats)]
+  X_test  <- X_test[, !(names(X_test)  %in% const_feats)]
+}
+
+# 12. Prepare storage for test preds
+Ntst     <- nrow(X_test)
+P        <- length(Y_columns)
+final_te <- matrix(NA, nrow = Ntst, ncol = P, dimnames = list(NULL, Y_columns))
+
+# 13. Loop over each target with per-target CatBoost tuning (including bagging_temperature) & Intensity weighting
+for (j in seq_along(Y_columns)) {
+  target   <- Y_columns[j]
+  y_tr     <- df[[target]]
+  bemkl_tr <- Y_bemkl_tr[, j]
+  bemkl_te <- Y_bemkl_te[, j]
+
+  cat(sprintf("→ Tuning CatBoost for %s (weighted by Intensity + Bayesian bagging)\n", target))
+
+  # build train & test pools (weights = df$Intensity)
+  wts     <- X_train$Intensity
+  pool_tr <- catboost.load_pool(
+    data   = X_train,
+    label  = y_tr,
+    weight = wts
+  )
+  pool_te <- catboost.load_pool(
+    data   = X_test
+  )
+
+  # hyperparameter grid (including Bayesian bagging temperature)
+  grid <- expand.grid(
+    depth               = c(2, 4, 6, 8),
+    learning_rate       = c(0.01, 0.05),
+    l2_leaf_reg         = c(1, 3, 5, 7),
+    bagging_temperature = c(0, 1, 3, 5, 10)
+  )
+
+  best_rmse   <- Inf
+  best_iter   <- NULL
+  best_params <- list()
+
+  # 13a) CV loop over grid
+  for (i in seq_len(nrow(grid))) {
+    params <- list(
+      loss_function       = "RMSE",
+      iterations          = 700,
+      depth               = grid$depth[i],
+      learning_rate       = grid$learning_rate[i],
+      l2_leaf_reg         = grid$l2_leaf_reg[i],
+      bootstrap_type      = "Bayesian",
+      bagging_temperature = grid$bagging_temperature[i],
+      random_seed         = 1606,
+      od_type             = "Iter",
+      od_wait             = 50,
+      verbose             = 0
+    )
+
+    cv_res <- catboost.cv(
+      pool       = pool_tr,
+      params     = params,
+      fold_count = 5,
+      type       = "Classical"
+    )
+
+    iter_rmse <- cv_res$test.RMSE.mean
+    min_rmse  <- min(iter_rmse)
+    iter_at   <- which.min(iter_rmse)
+
+    if (min_rmse < best_rmse) {
+      best_rmse   <- min_rmse
+      best_iter   <- iter_at
+      best_params <- params
+    }
+  }
+
+  cat(sprintf(
+    "  • Best CV RMSE=%.5f at iter=%d (depth=%d, lr=%.3f, l2=%d, temp=%.1f)\n",
+    best_rmse, best_iter,
+    best_params$depth,
+    best_params$learning_rate,
+    best_params$l2_leaf_reg,
+    best_params$bagging_temperature
+  ))
+
+  # 13b) Final train with tuned params
+  best_params$iterations <- best_iter
+  final_mod <- catboost.train(
+    learn_pool = pool_tr,
+    params     = best_params
+  )
+
+  # 13c) Predict
+  pred_cat_tr <- catboost.predict(final_mod, pool_tr)
+  pred_cat_te <- catboost.predict(final_mod, pool_te)
+
+  # 13d) Stack with BEMKL output via ridge meta-learner
+  stack_tr <- cbind(pred_cat_tr, bemkl_tr)
+  stack_te <- cbind(pred_cat_te, bemkl_te)
+
+  meta_cv <- cv.glmnet(
+    x      = stack_tr,
+    y      = y_tr,
+    alpha  = 0,
+    nfolds = 5
+  )
+
+  final_te[, j] <- as.vector(
+    predict(meta_cv, stack_te, s = "lambda.min")
+  )
+}
+
+# 14. Write wide submission
+submission <- data.frame(molecule = mol_t, final_te, check.names = FALSE)
+write.csv(
+  submission,
+  "/scratch/project_2006318/submission_weighted_catboost_temp_tuned_ensemble.csv",
+  row.names = FALSE
+)
+
+message("Done – per-target weighted CatBoost ensembles complete.")
