@@ -1,0 +1,201 @@
+# ——————————————————————————————————————————————————————————
+# Full R script: Ensemble with tuned GBM, rpart, and Elastic Net
+#   • Applies log₁₀ + z-score scaling to:
+#       – dilution
+#       – “view-3” columns (original numeric block columns 1830:1967)
+#   • Replaces any NaNs after scaling with zeros
+# ——————————————————————————————————————————————————————————
+
+# 1) Load (and install if needed) packages
+required_pkgs <- c("gbm", "rpart", "glmnet", "Matrix")
+for (pkg in required_pkgs) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# 2) Read data
+df   <- read.csv("/home/irfankhan/Downloads/dataset_on_31_May_2025.csv")
+df_t <- read.csv("/home/irfankhan/Downloads/dataset_on_01_June_2025_Leaderboard.csv")
+
+# 3) Define targets
+step1_Y <- c("Pleasantness", "Intensity")
+
+# 4) Prepare feature matrices (exclude molecule IDs and targets)
+feature_cols <- setdiff(names(df), c(step1_Y, "molecule_x", "molecule_y", "molecule"))
+raw_train_fs <- as.data.frame(sapply(df[ , feature_cols], as.numeric))
+raw_test_fs  <- as.data.frame(sapply(df_t[, feature_cols], as.numeric))
+
+# 5) Clean NaNs and NAs, mean-impute
+raw_train_fs[] <- lapply(raw_train_fs, function(x) { x[is.nan(x)] <- NA; x })
+raw_test_fs[]  <- lapply(raw_test_fs,  function(x) { x[is.nan(x)] <- NA; x })
+
+# if an entire column is NA, set to 0
+na_cols <- sapply(raw_train_fs, function(x) all(is.na(x)))
+if (any(na_cols)) {
+  raw_train_fs[, na_cols] <- 0
+  raw_test_fs[, na_cols]  <- 0
+}
+
+# mean-impute remaining NAs
+for (col in names(raw_train_fs)) {
+  mu <- mean(raw_train_fs[[col]], na.rm = TRUE)
+  raw_train_fs[[col]][ is.na(raw_train_fs[[col]])] <- mu
+  raw_test_fs[[col]][  is.na(raw_test_fs[[col]])] <- mu
+}
+
+# 6) Log₁₀-transform & z-score scale dilution + view-3 features
+all_features      <- names(df)
+view3_names       <- all_features[1830:1967]
+view3_cols        <- intersect(view3_names, feature_cols)
+cols_to_transform <- c("dilution", view3_cols)
+
+# train: log10 + scale
+train_mat    <- log10(as.matrix(raw_train_fs[ , cols_to_transform]) + 1e-6)
+train_scaled <- scale(train_mat, center = TRUE, scale = TRUE)
+# replace any NaNs (from zero variance) with 0
+train_scaled[is.nan(train_scaled)] <- 0
+raw_train_fs[ , cols_to_transform] <- as.data.frame(train_scaled)
+
+# record centers & scales
+centers <- attr(train_scaled, "scaled:center")
+scales  <- attr(train_scaled, "scaled:scale")
+
+# test: apply same log + scale
+test_mat    <- log10(as.matrix(raw_test_fs[ , cols_to_transform]) + 1e-6)
+test_scaled <- sweep(sweep(test_mat, 2, centers, "-"), 2, scales, "/")
+# replace any NaNs with 0
+test_scaled[is.nan(test_scaled)] <- 0
+raw_test_fs[ , cols_to_transform] <- as.data.frame(test_scaled)
+
+# 7) Prepare CV folds once
+set.seed(1606)
+n     <- nrow(raw_train_fs)
+folds <- sample(rep(1:5, length.out = n))
+
+# 8) Storage for first-step predictions
+n_test  <- nrow(raw_test_fs)
+Y1_pred <- matrix(NA, n_test, length(step1_Y))
+colnames(Y1_pred) <- step1_Y
+
+# 9) Ensemble loop with hyperparameter tuning
+for (j in seq_along(step1_Y)) {
+  ytrain <- df[[ step1_Y[j] ]]
+ 
+  # 9a) Tune GBM via 5-fold CV built into gbm
+  gbm_grid <- expand.grid(
+    shrinkage = c(0.01, 0.05, 0.1),
+    depth     = c(1, 3, 5)
+  )
+  best_gbm_mse <- Inf
+  best_gbm     <- list()
+  for (i in seq_len(nrow(gbm_grid))) {
+    prms <- gbm_grid[i, ]
+    mod_cv <- gbm::gbm(
+      formula           = ytrain ~ .,
+      data              = cbind(ytrain, raw_train_fs),
+      distribution      = "gaussian",
+      n.trees           = 500,
+      interaction.depth = prms$depth,
+      shrinkage         = prms$shrinkage,
+      cv.folds          = 5,
+      verbose           = FALSE
+    )
+    best_iter <- gbm::gbm.perf(mod_cv, method = "cv", plot.it = FALSE)
+    cv_err    <- mod_cv$cv.error[best_iter]
+    if (cv_err < best_gbm_mse) {
+      best_gbm_mse <- cv_err
+      best_gbm     <- list(
+        shrinkage = prms$shrinkage,
+        depth     = prms$depth,
+        n.trees   = best_iter
+      )
+    }
+  }
+  mod_gbm <- gbm::gbm(
+    ytrain ~ .,
+    data              = cbind(ytrain, raw_train_fs),
+    distribution      = "gaussian",
+    n.trees           = best_gbm$n.trees,
+    interaction.depth = best_gbm$depth,
+    shrinkage         = best_gbm$shrinkage,
+    verbose           = FALSE
+  )
+  pred_gbm <- predict(mod_gbm, raw_test_fs, n.trees = best_gbm$n.trees)
+ 
+  # 9b) Tune rpart via manual 5-fold CV
+  rpart_grid <- expand.grid(
+    maxdepth = c(3, 5, 7),
+    minsplit = c(10, 20, 50)
+  )
+  best_rp_mse <- Inf
+  best_rp     <- list()
+  for (i in seq_len(nrow(rpart_grid))) {
+    prms   <- rpart_grid[i, ]
+    cv_errs <- numeric(5)
+    for (f in 1:5) {
+      tr_idx  <- which(folds != f)
+      va_idx  <- which(folds == f)
+      mod_tmp <- rpart::rpart(
+        formula = ytrain[tr_idx] ~ .,
+        data    = raw_train_fs[tr_idx, , drop = FALSE],
+        control = rpart::rpart.control(
+          maxdepth = prms$maxdepth,
+          minsplit = prms$minsplit
+        )
+      )
+      pred_tmp     <- predict(mod_tmp, raw_train_fs[va_idx, , drop = FALSE])
+      cv_errs[f]   <- mean((pred_tmp - ytrain[va_idx])^2)
+    }
+    if (mean(cv_errs) < best_rp_mse) {
+      best_rp_mse <- mean(cv_errs)
+      best_rp     <- list(
+        maxdepth = prms$maxdepth,
+        minsplit = prms$minsplit
+      )
+    }
+  }
+  mod_rp  <- rpart::rpart(
+    ytrain ~ .,
+    data    = cbind(ytrain, raw_train_fs),
+    control = rpart::rpart.control(
+      maxdepth = best_rp$maxdepth,
+      minsplit = best_rp$minsplit
+    )
+  )
+  pred_rp <- predict(mod_rp, raw_test_fs)
+ 
+  # 9c) Tune Elastic Net via glmnet CV
+  alpha_grid <- seq(0, 1, by = 0.1)
+  best_cvm   <- Inf
+  best_cvmod <- NULL
+  for (a in alpha_grid) {
+    cv_mod <- glmnet::cv.glmnet(
+      x           = as.matrix(raw_train_fs),
+      y           = ytrain,
+      alpha       = a,
+      nfolds      = 5,
+      standardize = TRUE
+    )
+    idx_min <- which(cv_mod$lambda == cv_mod$lambda.min)
+    if ((err <- cv_mod$cvm[idx_min]) < best_cvm) {
+      best_cvm   <- err
+      best_cvmod <- cv_mod
+    }
+  }
+  pred_enet <- as.vector(
+    predict(best_cvmod, as.matrix(raw_test_fs), s = "lambda.min")
+  )
+ 
+  # 9d) Ensemble via harmonic mean
+  Y1_pred[, j] <- 3 / (1/pred_gbm + 1/pred_rp + 1/pred_enet)
+}
+
+# 10) Save predictions
+write.csv(
+  Y1_pred,
+  "/home/irfankhan/Downloads/Y_predictions_intensity_pleasantness_lll_27june.csv",
+  row.names = FALSE
+)
+cat("✅ Ensemble predictions saved with log-scaled dilution & view-3 features.\n")
