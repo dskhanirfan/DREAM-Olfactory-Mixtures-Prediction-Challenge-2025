@@ -1,0 +1,216 @@
+# =============================================================================
+# Learned Stack Ensemble with tuned GBM + rpart + ElasticNet
+#   • Includes Intensity & Pleasantness as BEMKL views
+#   • Removes features ≥99% correlated before training base learners
+#   • Log₁₀ + z-score scaling on dilution & “View-3” block
+#   • PCA on ensemble features: keep top 50 components
+# =============================================================================
+
+# 0. Auto‐install & load required packages
+required_pkgs <- c("gbm", "rpart", "glmnet", "Matrix")
+for (pkg in required_pkgs) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# 1. Load BEMKL functions
+source("/home/irfankhan/Downloads/bemkl/bemkl_supervised_multioutput_regression_variational_train.R")
+source("/home/irfankhan/Downloads/bemkl/bemkl_supervised_multioutput_regression_variational_test.R")
+
+# 2. Set BEMKL parameters and seed
+parameters <- list(
+  alpha_lambda  = 1,  beta_lambda    = 0.1,
+  alpha_upsilon = 1,  beta_upsilon   = 1,
+  alpha_gamma   = 1,  beta_gamma     = 1,
+  alpha_omega   = 1,  beta_omega     = 1,
+  alpha_epsilon = 1,  beta_epsilon   = 1,
+  iteration     = 200,
+  progress      = 0,
+  seed          = 1606
+)
+set.seed(parameters$seed)
+
+# 3. Load data
+#df              <- read.csv("/home/irfankhan/Downloads/dataset_on_31_May_2025.csv")
+df              <- read.csv("/home/irfankhan/Downloads/data_created_on_26_July_2025.csv")
+#df_t            <- read.csv("/home/irfankhan/Downloads/dataset_on_01_June_2025_Leaderboard.csv")
+#submission_form <- read.csv("/home/irfankhan/Downloads/TASK1_leaderboard_set_Submission_form.csv")
+df_t           <- read.csv("/home/irfankhan/Downloads/dataset_on_01_June_2025_Test.csv")
+#submission_form<- read.csv("/home/irfankhan/Downloads/TASK1_leaderboard_set_Submission_form.csv")
+submission_form<- read.csv("/home/irfankhan/Downloads/TASK1_test_set_Submission_form.csv")
+custom_row_names<- submission_form[[1]]
+pp_preds        <- read.csv("/home/irfankhan/Downloads/Y_predictions_intensity_pleasantness_24_july.csv")
+
+# 4. Define BEMKL targets (exclude Intensity & Pleasantness)
+Y_columns     <- c(
+  "Green","Cucumber","Herbal","Mint","Woody","Pine","Floral","Powdery","Fruity",
+  "Citrus","Tropical","Berry","Peach","Sweet","Caramellic","Vanilla","BrownSpice",
+  "Smoky","Burnt","Roasted","Grainy","Meaty","Nutty","Fatty","Coconut","Waxy","Dairy",
+  "Buttery","Cheesy","Sour","Fermented","Sulfurous","Garlic.Onion","Earthy","Mushroom",
+  "Musty","Ammonia","Fishy","Fecal","Rotten.Decay","Rubber","Phenolic","Animal",
+  "Medicinal","Cooling","Sharp","Chlorine","Alcoholic","Plastic","Ozone","Metallic"
+)
+Y_mat         <- as.matrix(df[, Y_columns])   # Ntrain × P
+Ntrain        <- nrow(Y_mat)
+P             <- ncol(Y_mat)
+Y_bemkl_train <- t(Y_mat)                     # P × Ntrain
+
+# 5. Define raw feature matrices for BEMKL
+X    <- df[,   !(names(df)   %in% c(Y_columns,"molecule_x","molecule_y","molecule"))]
+X_t  <- df_t[, !(names(df_t) %in% c(Y_columns,"molecule_x","molecule_y","molecule"))]
+Ntst <- nrow(X_t)
+
+# 6. Preprocessing helpers
+robust_scaler <- function(data) {
+  list(
+    medians = apply(data, 2, median, na.rm = TRUE),
+    iqrs    = apply(data, 2, IQR,    na.rm = TRUE)
+  )
+}
+apply_robust_scaler <- function(data, sc) {
+  tmp <- sweep(data, 2, sc$medians, "-")
+  sweep(tmp, 2, sc$iqrs + 1e-10, "/")
+}
+
+
+# 7. Build BEMKL views
+## View-1: spectral block (cols 6:1829)
+X1_sub <- X[, 6:1829]
+X1_sub[] <- lapply(X1_sub, function(col) {
+  if (!is.numeric(col)) suppressWarnings(as.numeric(col)) else col
+})
+for (j in seq_len(ncol(X1_sub))) {
+  if (anyNA(X1_sub[[j]])) {
+    X1_sub[[j]][is.na(X1_sub[[j]])] <- mean(X1_sub[[j]], na.rm = TRUE)
+  }
+}
+scaler1  <- robust_scaler(X1_sub)
+X1_train <- as.matrix(apply_robust_scaler(X1_sub, scaler1))
+X1_test  <- as.matrix(apply_robust_scaler(X_t[, 6:1829], scaler1))
+
+## View-2: Morgan fingerprint (cols 1968:4015)
+X2_train <- as.matrix(X[, 1968:4015])
+X2_test  <- as.matrix(X_t[, 1968:4015])
+
+## View-3: other numeric block (cols 1830:1967) — now log₁₀ + z-score
+X3_sub <- X[, 1830:1967]
+X3_sub[] <- lapply(X3_sub, function(col) {
+  if (!is.numeric(col)) suppressWarnings(as.numeric(col)) else col
+})
+for (j in seq_len(ncol(X3_sub))) {
+  if (anyNA(X3_sub[[j]])) {
+    X3_sub[[j]][is.na(X3_sub[[j]])] <- mean(X3_sub[[j]], na.rm = TRUE)
+  }
+}
+# log-transform + standard scale
+X3_log   <- log10(as.matrix(X3_sub) + 1e-6)
+X3_train <- as.matrix(scale(X3_log))
+# apply same transform to test
+X3_test_mat  <- log10(as.matrix(X_t[,1830:1967]) + 1e-6)
+X3_test      <- sweep(
+  X3_test_mat,
+  2,
+  attr(X3_train, "scaled:center"),
+  "-"
+)
+X3_test      <- sweep(
+  X3_test,
+  2,
+  attr(X3_train, "scaled:scale"),
+  "/"
+)
+
+## View-4: dilution (log‐scaled + standard scaled)
+X4_sub   <- as.matrix(X[, "dilution", drop = FALSE])
+X4_log   <- log10(X4_sub + 1e-6)
+X4_train <- as.matrix(scale(X4_log))
+X4_test  <- as.matrix(scale(
+  log10(as.matrix(X_t[,"dilution", drop=FALSE]) + 1e-6),
+  center = attr(X4_train, "scaled:center"),
+  scale  = attr(X4_train, "scaled:scale")
+))
+
+## View-5: labels & filters
+X5_train <- as.matrix(df[, c("Intensity_label","solvent_x_NT","solvent_x_PG","GhoseFilter_True")])
+X5_test  <- as.matrix(df_t[, c("Intensity_label","solvent_x_NT","solvent_x_PG","GhoseFilter_True")])
+
+## View-6 & -7: Intensity & Pleasantness
+X6_train <- as.matrix(df$Intensity)
+X7_train <- as.matrix(df$Pleasantness)
+X6_test  <- as.matrix(pp_preds$Intensity)
+X7_test  <- as.matrix(pp_preds$Pleasantness)
+
+# 8. Kernel functions (unchanged)
+linear_kernel <- function(A, B = NULL) {
+  A <- as.matrix(A); B <- if (is.null(B)) A else as.matrix(B)
+  A[is.na(A)] <- 0; B[is.na(B)] <- 0
+  A %*% t(B)
+}
+polynomial_kernel <- function(A, B = NULL, degree = 4, coef0 = 1) {
+  A <- as.matrix(A); B <- if(is.null(B)) A else as.matrix(B)
+  K <- (A %*% t(B) + coef0)^degree; K[is.na(K)] <- 0; K
+}
+jaccard_kernel <- function(A, B = NULL) {
+  A <- as.matrix(A); B <- if(is.null(B)) A else as.matrix(B)
+  n1 <- nrow(A); n2 <- nrow(B); K <- matrix(0, n1, n2)
+  for(i in seq_len(n1)) for(j in seq_len(n2)) {
+    inter <- sum(A[i,] & B[j,], na.rm=TRUE)
+    uni   <- sum(A[i,] | B[j,], na.rm=TRUE)
+    K[i,j] <- if(uni==0) 0 else inter/uni
+  }
+  K
+}
+
+# 9. BEMKL train/test helper (now 7 views)
+train_and_predict <- function(kernel_fn) {
+  Ktr <- array(0, dim = c(Ntrain, Ntrain, 7))
+  Kte <- array(0, dim = c(Ntrain, Ntst,   7))
+  Ktr[,,1] <- polynomial_kernel(X1_train, X1_train)
+  Ktr[,,2] <- jaccard_kernel(    X2_train, X2_train)
+  Ktr[,,3] <- kernel_fn(         X3_train, X3_train)
+  Ktr[,,4] <- kernel_fn(         X4_train, X4_train)
+  Ktr[,,5] <- jaccard_kernel(    X5_train, X5_train)
+  Ktr[,,6] <- kernel_fn(         X6_train, X6_train)
+  Ktr[,,7] <- kernel_fn(         X7_train, X7_train)
+  for (p in 1:7) diag(Ktr[,,p]) <- diag(Ktr[,,p]) + 1e-6
+ 
+  state <- bemkl_supervised_multioutput_regression_variational_train(
+    Ktr, Y_bemkl_train, parameters
+  )
+  Y_tr_lin <- t(bemkl_supervised_multioutput_regression_variational_test(Ktr, state)$Y$mu)
+ 
+  Kte[,,1] <- polynomial_kernel(X1_train, X1_test)
+  Kte[,,2] <- jaccard_kernel(    X2_train, X2_test)
+  Kte[,,3] <- kernel_fn(         X3_train, X3_test)
+  Kte[,,4] <- kernel_fn(         X4_train, X4_test)
+  Kte[,,5] <- jaccard_kernel(    X5_train, X5_test)
+  Kte[,,6] <- kernel_fn(         X6_train, X6_test)
+  Kte[,,7] <- kernel_fn(         X7_train, X7_test)
+  for (p in 1:7) diag(Kte[,,p]) <- diag(Kte[,,p]) + 1e-6
+ 
+  Y_te_lin <- t(bemkl_supervised_multioutput_regression_variational_test(Kte, state)$Y$mu)
+  list(train = Y_tr_lin, test = Y_te_lin)
+}
+
+# Run BEMKL with linear & poly kernels
+res_lin    <- train_and_predict(linear_kernel)
+res_poly   <- train_and_predict(polynomial_kernel)
+Y_bemkl_tr <- (res_lin$train + res_poly$train) / 2
+Y_bemkl_te <- (res_lin$test  + res_poly$test ) / 2
+
+
+rownames(Y_bemkl_tr) <- rownames(df)
+colnames(Y_bemkl_tr) <- Y_columns
+
+rownames(Y_bemkl_te) <- custom_row_names
+colnames(Y_bemkl_te) <- Y_columns
+#
+# # write out
+# write.csv(Y_bemkl_tr, file = "Y_bemkl_tr.csv", row.names = TRUE)
+# write.csv(Y_bemkl_te, file = "Y_bemkl_te.csv", row.names = TRUE)
+save(Y_bemkl_tr, Y_bemkl_te,
+     file = "/home/irfankhan/Downloads/Y_bemkl_results.RData")
+saveRDS(Y_bemkl_tr, file = "/home/irfankhan/Downloads/Y_bemkl_tr_full.rds")
+saveRDS(Y_bemkl_te, file = "/home/irfankhan/Downloads/Y_bemkl_te_full.rds")
