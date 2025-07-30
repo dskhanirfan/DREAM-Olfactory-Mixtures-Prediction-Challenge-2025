@@ -1,0 +1,128 @@
+# =============================================================================
+# CatBoost-only pipeline for Pleasantness & Intensity
+#   • Loads & mean-imputes raw features
+#   • Applies log₁₀ + z-score scaling to dilution & “view-3” (cols 1830–1967)
+#   • Removes features with zero variance or ≥99.5% correlation
+#   • Trains one CatBoost regressor per target (Pleasantness, Intensity)
+#   • Writes out predictions in the same format as before
+# =============================================================================
+
+# 1) Load (and install if needed) CatBoost & Matrix
+
+.libPaths(c("/projappl/project_2006318/project_rpackages_4.4.2", .libPaths()))
+libpath <- .libPaths()[1]
+library(catboost)
+library(Matrix)
+
+# 1. Read data & PP preds
+df	 <- read.csv("/scratch/project_2006318/dataset_on_31_May_2025.csv")
+df_t        <- read.csv("/scratch/project_2006318/testData/dataset_on_01_June_2025_Test.csv")
+#df_t     <- read.csv("/scratch/project_2006318/dataset_on_01_June_2025_Leaderboard.csv")
+# 3) Define targets
+step1_Y <- c("Pleasantness", "Intensity")
+
+# 4) Prepare feature matrices (exclude molecule IDs & targets)
+feature_cols  <- setdiff(names(df), c(step1_Y, "molecule_x", "molecule_y", "molecule"))
+raw_train_fs  <- as.data.frame(sapply(df[ , feature_cols], as.numeric))
+raw_test_fs   <- as.data.frame(sapply(df_t[, feature_cols], as.numeric))
+
+# 4a) Add any PP preds if you have them for test (optional)
+# raw_test_fs$Pleasantness <- pp_preds$Pleasantness
+# raw_test_fs$Intensity    <- pp_preds$Intensity
+
+# 5) Clean NaNs / NAs and mean‐impute
+raw_train_fs[] <- lapply(raw_train_fs, function(x) { x[is.nan(x)] <- NA; x })
+raw_test_fs[]  <- lapply(raw_test_fs,  function(x) { x[is.nan(x)] <- NA; x })
+
+# if entire column NA, set to zero
+na_cols <- sapply(raw_train_fs, function(x) all(is.na(x)))
+if (any(na_cols)) {
+  raw_train_fs[, na_cols] <- 0
+  raw_test_fs[, na_cols]  <- 0
+}
+
+# mean‐impute remaining NAs
+for (col in names(raw_train_fs)) {
+  mu <- mean(raw_train_fs[[col]], na.rm = TRUE)
+  raw_train_fs[[col]][is.na(raw_train_fs[[col]])] <- mu
+  raw_test_fs[[col]][ is.na(raw_test_fs[[col]])] <- mu
+}
+
+# 6) Log₁₀-transform & z-score scale dilution + view-3 features
+all_features      <- names(df)
+view3_names       <- all_features[1830:1967]
+view3_cols        <- intersect(view3_names, feature_cols)
+cols_to_transform <- c("dilution", view3_cols)
+
+# train side
+train_mat    <- log10(as.matrix(raw_train_fs[, cols_to_transform]) + 1e-6)
+train_scaled <- scale(train_mat, center = TRUE, scale = TRUE)
+train_scaled[is.nan(train_scaled)] <- 0
+raw_train_fs[, cols_to_transform] <- as.data.frame(train_scaled)
+centers <- attr(train_scaled, "scaled:center")
+scales  <- attr(train_scaled, "scaled:scale")
+
+# test side
+test_mat    <- log10(as.matrix(raw_test_fs[, cols_to_transform]) + 1e-6)
+test_scaled <- sweep(sweep(test_mat, 2, centers, "-"), 2, scales, "/")
+test_scaled[is.nan(test_scaled)] <- 0
+raw_test_fs[, cols_to_transform] <- as.data.frame(test_scaled)
+
+# 7) Remove zero‐variance features
+var_col  <- sapply(raw_train_fs, function(col) var(col, na.rm = TRUE))
+zero_var <- (var_col == 0) | is.na(var_col)
+if (any(zero_var)) {
+  raw_train_fs <- raw_train_fs[, !zero_var, drop = FALSE]
+  raw_test_fs  <- raw_test_fs[, !zero_var, drop = FALSE]
+}
+
+# 8) Remove highly‐correlated features (|r| ≥ 0.995)
+corrMat <- abs(cor(raw_train_fs, use = "pairwise.complete.obs"))
+diag(corrMat) <- 0
+corrMat[is.na(corrMat)] <- 0
+n <- ncol(corrMat)
+keep <- rep(TRUE, n)
+for (i in seq_len(n - 1)) {
+  if (!keep[i]) next
+  for (j in (i + 1):n) {
+    if (keep[j] && corrMat[i, j] >= 0.995) keep[j] <- FALSE
+  }
+}
+if (any(!keep)) {
+  raw_train_fs <- raw_train_fs[, keep, drop = FALSE]
+  raw_test_fs  <- raw_test_fs[, keep, drop = FALSE]
+}
+
+# 9) Prepare storage for predictions
+n_test  <- nrow(raw_test_fs)
+Y1_pred <- matrix(NA, n_test, length(step1_Y), dimnames = list(NULL, step1_Y))
+
+# 10) Train & predict with CatBoost for each target
+set.seed(1606)
+for (j in seq_along(step1_Y)) {
+  target <- step1_Y[j]
+  ytrain <- df[[target]]
+
+  pool_tr <- catboost.load_pool(data = raw_train_fs, label = ytrain)
+  pool_te <- catboost.load_pool(data = raw_test_fs)
+
+  params <- list(
+    loss_function = "RMSE",
+    iterations    = 1000,
+    depth         = 6,
+    learning_rate = 0.05,
+    random_seed   = 1606,
+    verbose       = 0
+  )
+
+  model       <- catboost.train(pool_tr, NULL, params = params)
+  Y1_pred[, j] <- catboost.predict(model, pool_te)
+}
+
+# 11) Save predictions
+write.csv(
+  Y1_pred,
+  "/scratch/project_2006318/Y_predictions_intensity_pleasantness_catboost.csv",
+  row.names = FALSE
+)
+cat("✅ CatBoost predictions for Pleasantness & Intensity saved.\n")
